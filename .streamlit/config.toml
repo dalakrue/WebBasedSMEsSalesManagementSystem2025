@@ -1,3 +1,5 @@
 [server]
 enableXsrfProtection = false
 enableCORS = false
+[browser]
+serverAddress = "0.0.0.0"
