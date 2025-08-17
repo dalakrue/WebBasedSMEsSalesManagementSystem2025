@@ -14,6 +14,11 @@ import plotly.graph_objects as go
 import io
 import xlsxwriter
 from functools import lru_cache          # NEW (used later for DB cache)
+st.set_page_config(
+    page_title="Seller Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
 CSV_TABLES = [
     "users", "orders", "order_details",
     "products", "payments", "leads",
@@ -668,4 +673,5 @@ with st.expander("Generate Dummy Data"):
         st.success("Dummy data generation complete. Refresh the page to see changes.")
         st.cache_data.clear()
     if st.button("Generate Data"):
+
         _make_dummy_rows(engine)
