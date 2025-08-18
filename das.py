@@ -17,10 +17,12 @@ import io
 import xlsxwriter
 from functools import lru_cache          # NEW (used later for DB cache)
 # Use SQLite file directly from repo
-sqlite_path = "db.sqlite3"  # relative path in repo
-uri = f"sqlite+pysqlite:///{sqlite_path}"
-engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
-st.sidebar.success(f"Using SQLite DB from repo: {sqlite_path}")
+# Ensure session_state is set so the rest of the app works
+if "sqlite_path" not in st.session_state:
+    st.session_state["sqlite_path"] = "db.sqlite3"
+    uri = f"sqlite+pysqlite:///{st.session_state['sqlite_path']}"
+    engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
+
 CSV_TABLES = [
     "users", "orders", "order_details",
     "products", "payments", "leads",
