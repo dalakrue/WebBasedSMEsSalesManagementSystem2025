@@ -277,11 +277,14 @@ up_db = st.sidebar.file_uploader(
 )
 
 if up_db:
-    # Save uploaded DB in Streamlit Cloud
-    save_path = os.path.join(os.getcwd(), up_db.name)
+    tmp_dir = os.path.join("/tmp", "sqlite_uploads")  # safe folder
+    os.makedirs(tmp_dir, exist_ok=True)
+    save_path = os.path.join(tmp_dir, up_db.name)
+
     with st.spinner("Saving uploaded DB..."):
         with open(save_path, "wb") as f:
             f.write(up_db.getbuffer())
+
     st.session_state["sqlite_path"] = save_path
     st.sidebar.success(f"Saved uploaded DB to: {save_path}")
 
