@@ -16,6 +16,11 @@ import plotly.graph_objects as go
 import io
 import xlsxwriter
 from functools import lru_cache          # NEW (used later for DB cache)
+# Use SQLite file directly from repo
+sqlite_path = "db.sqlite3"  # relative path in repo
+uri = f"sqlite+pysqlite:///{sqlite_path}"
+engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
+
 CSV_TABLES = [
     "users", "orders", "order_details",
     "products", "payments", "leads",
@@ -284,8 +289,6 @@ if up_db:
     with st.spinner("Saving uploaded DB..."):
         with open(save_path, "wb") as f:
             f.write(up_db.getbuffer())
-
-    st.session_state["sqlite_path"] = save_path
     st.sidebar.success(f"Saved uploaded DB to: {save_path}")
 
 
