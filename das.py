@@ -276,37 +276,15 @@ up_db = st.sidebar.file_uploader(
     key="sqlite_upload"
 )
 
-if up_db is not None:
-    # create a small tmp folder to avoid writing to root
-    tmp_dir = os.path.join(os.getcwd(), "tmp_sqlite")
-    os.makedirs(tmp_dir, exist_ok=True)
-    save_path = os.path.join(tmp_dir, up_db.name)
-
-    try:
+if up_db:
+    # Save uploaded DB in Streamlit Cloud
+    save_path = os.path.join(os.getcwd(), up_db.name)
+    with st.spinner("Saving uploaded DB..."):
         with open(save_path, "wb") as f:
             f.write(up_db.getbuffer())
-    except Exception as e:
-        st.sidebar.error(f"Failed to save uploaded file: {e}")
-    else:
-        # Try to update session_state (may fail on some Streamlit runtimes)
-        try:
-            with st.spinner("Saving uploaded DB..."):
-             with open(save_path, "wb") as f:
-              f.write(up_db.getbuffer())
-            st.session_state["sqlite_path"] = save_path
-            st.sidebar.success(f"Saved uploaded DB to: {save_path}")
-        except Exception as e:
-            # fallback UX: tell user to press a button to apply the uploaded file
-            st.sidebar.warning(
-                "Couldn't update session state automatically. Click 'Use uploaded DB' to apply."
-            )
-            if st.sidebar.button("Use uploaded DB", key="apply_uploaded_sqlite"):
-                # attempt again inside a button callback (safer)
-                try:
-                    st.session_state["sqlite_path"] = save_path
-                    st.sidebar.success(f"Applied uploaded DB: {save_path}")
-                except Exception as e2:
-                    st.sidebar.error(f"Still couldn't set path: {e2}")
+    st.session_state["sqlite_path"] = save_path
+    st.sidebar.success(f"Saved uploaded DB to: {save_path}")
+
 
 
     # Action buttons
