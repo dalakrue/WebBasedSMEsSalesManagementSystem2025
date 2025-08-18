@@ -1,6 +1,8 @@
 import sys
 import datetime as dt
 from typing import Dict, List, Optional, Tuple
+import yaml
+from yaml.loader import SafeLoader
 import os
 import pandas as pd
 import numpy as np
@@ -14,11 +16,6 @@ import plotly.graph_objects as go
 import io
 import xlsxwriter
 from functools import lru_cache          # NEW (used later for DB cache)
-st.set_page_config(
-    page_title="Seller Dashboard",
-    page_icon="📊",
-    layout="wide"
-)
 CSV_TABLES = [
     "users", "orders", "order_details",
     "products", "payments", "leads",
@@ -69,70 +66,68 @@ _DB_KEY = "db_engine"
 def get_engine():
     """Return a cached engine or None."""
     return st.session_state.get(_DB_KEY)
-
-def connect_db():
+def disconnect_db():
     """
-    Build and cache a DB engine.
-    Uses env-vars so you never type the password in the notebook /
-    web-page (Google will therefore stop nagging you about reused
-    passwords in forms).
+    Dispose and forget the cached DB engine.
     """
-    if _DB_KEY in st.session_state:
-        st.info("Already connected.")
-        return st.session_state[_DB_KEY]
+    engine = st.session_state.pop(_DB_KEY, None)
+    if engine is not None:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+    st.success("🔌 Disconnected from DB")
 
-    uri = os.getenv("DATABASE_URI")   # e.g.  postgres://user:pass@host/db
-    if not uri:
-        st.error("DATABASE_URI env-var not set"); return None
-
-    try:
-        engine = sa.create_engine(uri, pool_pre_ping=True, pool_recycle=280)
-        st.session_state[_DB_KEY] = engine
-        st.success("✅ Connected to DB")
-        return engine
-    except Exception as e:
-        st.error(f"❌ Connection failed: {e}")
-        return None
-
-# =========================================================================
-#  Replace the entire original connect_db function (lines 81-98) with this
-# =========================================================================
-def connect_db():
+def connect_db(db_type: Optional[str] = None):
     """
-    Build and cache a DB engine using inputs from the Streamlit sidebar.
+    Build and cache a DB engine from sidebar inputs.
+    Supports MySQL and SQLite.
     """
     if _DB_KEY in st.session_state:
         st.info("Already connected.")
         return st.session_state[_DB_KEY]
 
-    # ✅ NEW: Add input fields to the sidebar
-    st.sidebar.subheader("Database Connection")
-    host     = st.sidebar.text_input("Host", value="localhost")
-    port     = st.sidebar.text_input("Port", value="3306")
-    db_name  = st.sidebar.text_input("Database Name", value="sample_data")
-    user     = st.sidebar.text_input("User", value="root")
-    password = st.sidebar.text_input("Password", value="root", type="password")
-
-    # If any field is empty, don't try to connect
-    if not all([host, port, db_name, user]):
-        st.warning("Please fill in all database connection details.")
-        return None
-
-    # ✅ NEW: Build the URI from the inputs instead of os.getenv()
-    # This example is for MySQL. Adjust the pattern for PostgreSQL etc.
-    uri = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{db_name}"
+    # Read DB type (default to MySQL if not set)
+    db_type = db_type or st.session_state.get("db_type", "MySQL")
 
     try:
-        engine = sa.create_engine(uri, pool_pre_ping=True, pool_recycle=280)
-        # Test the connection to give immediate feedback
-        connection = engine.connect()
-        connection.close()
+        if db_type == "SQLite":
+            # Expect a local file path from the sidebar (or uploaded file saved to disk)
+            sqlite_path = st.session_state.get("sqlite_path", "")
+            if not sqlite_path:
+                st.error("Provide a SQLite file path or upload a .db/.sqlite file first.")
+                return None
+
+            uri = f"sqlite+pysqlite:///{sqlite_path}"
+            engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
+
+        else:
+            # MySQL path (values should already be in session_state from the sidebar)
+            host     = st.session_state.get("mysql_host", "localhost")
+            port     = st.session_state.get("mysql_port", "3306")
+            db_name  = st.session_state.get("mysql_db", "sample_data")
+            user     = st.session_state.get("mysql_user", "root")
+            password = st.session_state.get("mysql_password", "root")
+
+            if not all([host, port, db_name, user]):
+                st.warning("Please fill in all database connection details.")
+                return None
+
+            uri = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{db_name}"
+            engine = sa.create_engine(uri, pool_pre_ping=True, pool_recycle=280)
+
+        # Test connection
+        with engine.connect() as _:
+            pass
+
         st.session_state[_DB_KEY] = engine
-        st.success("✅ Connected to DB")
+        st.success(f"✅ Connected to {db_type}")
         return engine
+
     except Exception as e:
         st.error(f"❌ Connection failed: {e}")
         return None
+
 
 
 def merge_price_into_order_details(od: pd.DataFrame,
@@ -237,10 +232,51 @@ data_source = st.sidebar.radio(
     key="data_source_mode"
 )
 if data_source == "Database":
+    st.sidebar.subheader("Database Connection")
+
+    # Choose DB Type
+    db_type = st.sidebar.radio(
+        "DB Type",
+        ("MySQL", "SQLite"),
+        horizontal=True,
+        key="db_type"
+    )
+
+    if db_type == "MySQL":
+        st.sidebar.text_input("Host", value=st.session_state.get("mysql_host", "localhost"), key="mysql_host")
+        st.sidebar.text_input("Port", value=st.session_state.get("mysql_port", "3306"), key="mysql_port")
+        st.sidebar.text_input("Database Name", value=st.session_state.get("mysql_db", "sample_data"), key="mysql_db")
+        st.sidebar.text_input("User", value=st.session_state.get("mysql_user", "root"), key="mysql_user")
+        st.sidebar.text_input("Password", value=st.session_state.get("mysql_password", "root"), type="password", key="mysql_password")
+
+    else:
+        # SQLite path entry
+        st.sidebar.text_input(
+            "SQLite file path",
+            value=st.session_state.get("sqlite_path", "sample_data.sqlite3"),
+            key="sqlite_path"
+        )
+
+        # Or upload a SQLite file and save it locally (so SQLAlchemy can connect)
+        up_db = st.sidebar.file_uploader(
+            "…or Upload a SQLite .db / .sqlite file",
+            type=["db", "sqlite", "sqlite3"],
+            key="sqlite_upload"
+        )
+        if up_db:
+            save_path = os.path.join(os.getcwd(), up_db.name)
+            with open(save_path, "wb") as f:
+                f.write(up_db.getbuffer())
+            st.session_state["sqlite_path"] = save_path
+            st.sidebar.success(f"Saved uploaded DB to: {save_path}")
+
+    # Action buttons
     if st.sidebar.button("Connect DB"):
-        connect_db()
+        connect_db(st.session_state.get("db_type", "MySQL"))
+
     if st.sidebar.button("Disconnect DB"):
         disconnect_db()
+
 
 engine = get_engine() if data_source == "Database" else None
 
@@ -673,5 +709,4 @@ with st.expander("Generate Dummy Data"):
         st.success("Dummy data generation complete. Refresh the page to see changes.")
         st.cache_data.clear()
     if st.button("Generate Data"):
-
         _make_dummy_rows(engine)
