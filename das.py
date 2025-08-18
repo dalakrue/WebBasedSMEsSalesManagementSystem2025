@@ -20,7 +20,7 @@ from functools import lru_cache          # NEW (used later for DB cache)
 sqlite_path = "db.sqlite3"  # relative path in repo
 uri = f"sqlite+pysqlite:///{sqlite_path}"
 engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
-
+st.sidebar.success(f"Using SQLite DB from repo: {sqlite_path}")
 CSV_TABLES = [
     "users", "orders", "order_details",
     "products", "payments", "leads",
@@ -281,23 +281,11 @@ up_db = st.sidebar.file_uploader(
     key="sqlite_upload"
 )
 
-if up_db:
-    tmp_dir = os.path.join("/tmp", "sqlite_uploads")  # safe folder
-    os.makedirs(tmp_dir, exist_ok=True)
-    save_path = os.path.join(tmp_dir, up_db.name)
-
-    with st.spinner("Saving uploaded DB..."):
-        with open(save_path, "wb") as f:
-            f.write(up_db.getbuffer())
-    st.sidebar.success(f"Saved uploaded DB to: {save_path}")
-
-
-
     # Action buttons
-    if st.sidebar.button("Connect DB"):
+if st.sidebar.button("Connect DB"):
         connect_db(st.session_state.get("db_type", "MySQL"))
 
-    if st.sidebar.button("Disconnect DB"):
+if st.sidebar.button("Disconnect DB"):
         disconnect_db()
 
 
