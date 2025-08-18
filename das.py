@@ -57,6 +57,13 @@ st.set_page_config(page_title="📊 SME Sales Management Dashboard",
                    layout="wide",
                    initial_sidebar_state="expanded")
 st.title("📊 Advanced Sales Management Dashboard for SMEs")
+# ------------------ SESSION STATE SAFE DEFAULTS ------------------
+# initialize keys we rely on so setting them later is safe
+if "sqlite_path" not in st.session_state:
+    st.session_state["sqlite_path"] = ""   # file path for SQLite DB
+# Optional: keep engine key defined but leave value as-is if user connected earlier
+# (get_engine already uses st.session_state.get(_DB_KEY), so no strict need to set it here)
+# ----------------------------------------------------------------
 
 # ============================== 3. Helper & Utility Functions ================
 
@@ -92,14 +99,19 @@ def connect_db(db_type: Optional[str] = None):
 
     try:
         if db_type == "SQLite":
-            # Expect a local file path from the sidebar (or uploaded file saved to disk)
-            sqlite_path = st.session_state.get("sqlite_path", "")
-            if not sqlite_path:
-                st.error("Provide a SQLite file path or upload a .db/.sqlite file first.")
-                return None
+    # Expect a local file path from the sidebar (or uploaded file saved to disk)
+          sqlite_path = st.session_state.get("sqlite_path", "") or ""
+          if not sqlite_path:
+           st.error("Provide a SQLite file path (type it or upload a .db file).")
+           return None
 
-            uri = f"sqlite+pysqlite:///{sqlite_path}"
-            engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
+    # Check file exists and is readable
+          if not os.path.exists(sqlite_path):
+            st.error(f"SQLite file not found: {sqlite_path}. Please upload or correct the path.")
+            return None
+
+          uri = f"sqlite+pysqlite:///{sqlite_path}"
+          engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
 
         else:
             # MySQL path (values should already be in session_state from the sidebar)
@@ -250,25 +262,52 @@ if data_source == "Database":
         st.sidebar.text_input("Password", value=st.session_state.get("mysql_password", "root"), type="password", key="mysql_password")
 
     else:
-        # SQLite path entry
-        st.sidebar.text_input(
-            "SQLite file path",
-            value=st.session_state.get("sqlite_path", "sample_data.sqlite3"),
-            key="sqlite_path"
-        )
+        # SQLite path entry (this text_input writes to st.session_state["sqlite_path"] automatically)
+     st.sidebar.text_input(
+      "SQLite file path (or upload below)",
+       value=st.session_state.get("sqlite_path", "sample_data.sqlite3"),
+       key="sqlite_path"
+)
 
-        # Or upload a SQLite file and save it locally (so SQLAlchemy can connect)
-        up_db = st.sidebar.file_uploader(
-            "…or Upload a SQLite .db / .sqlite file",
-            type=["db", "sqlite", "sqlite3"],
-            key="sqlite_upload"
-        )
-        if up_db:
-            save_path = os.path.join(os.getcwd(), up_db.name)
-            with open(save_path, "wb") as f:
-                f.write(up_db.getbuffer())
+# Upload a SQLite file and save it to a tmp folder. Use a safe write + fallback if session_state set fails.
+up_db = st.sidebar.file_uploader(
+    "…or upload a SQLite .db / .sqlite file",
+    type=["db", "sqlite", "sqlite3"],
+    key="sqlite_upload"
+)
+
+if up_db is not None:
+    # create a small tmp folder to avoid writing to root
+    tmp_dir = os.path.join(os.getcwd(), "tmp_sqlite")
+    os.makedirs(tmp_dir, exist_ok=True)
+    save_path = os.path.join(tmp_dir, up_db.name)
+
+    try:
+        with open(save_path, "wb") as f:
+            f.write(up_db.getbuffer())
+    except Exception as e:
+        st.sidebar.error(f"Failed to save uploaded file: {e}")
+    else:
+        # Try to update session_state (may fail on some Streamlit runtimes)
+        try:
+            with st.spinner("Saving uploaded DB..."):
+             with open(save_path, "wb") as f:
+              f.write(up_db.getbuffer())
             st.session_state["sqlite_path"] = save_path
             st.sidebar.success(f"Saved uploaded DB to: {save_path}")
+        except Exception as e:
+            # fallback UX: tell user to press a button to apply the uploaded file
+            st.sidebar.warning(
+                "Couldn't update session state automatically. Click 'Use uploaded DB' to apply."
+            )
+            if st.sidebar.button("Use uploaded DB", key="apply_uploaded_sqlite"):
+                # attempt again inside a button callback (safer)
+                try:
+                    st.session_state["sqlite_path"] = save_path
+                    st.sidebar.success(f"Applied uploaded DB: {save_path}")
+                except Exception as e2:
+                    st.sidebar.error(f"Still couldn't set path: {e2}")
+
 
     # Action buttons
     if st.sidebar.button("Connect DB"):
