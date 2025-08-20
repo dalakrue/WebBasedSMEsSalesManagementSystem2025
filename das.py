@@ -15,7 +15,68 @@ import plotly.express as px
 import plotly.graph_objects as go
 import io
 import xlsxwriter
-from functools import lru_cache          # NEW (used later for DB cache)
+from functools import lru_cache  
+import request 
+DJANGO_BASE = "http://127.0.0.1:8000"  # ← change this when you deploy Django
+
+# -----------------------------
+# Session state to store token
+# -----------------------------
+if "access" not in st.session_state:
+    st.session_state["access"] = None
+
+# -----------------------------
+# Login form
+# -----------------------------
+if st.session_state["access"] is None:
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+        if submitted:
+            login_url = f"{DJANGO_BASE}/api/token/"
+            try:
+                response = requests.post(login_url, json={"username": username, "password": password}, timeout=20)
+                response.raise_for_status()
+                tokens = response.json()
+                st.session_state["access"] = tokens["access"]
+                st.success(f"✅ Logged in as {username}")
+                st.experimental_rerun()  # reload app after login
+            except requests.HTTPError:
+                st.error("❌ Login failed. Check username/password")
+
+# -----------------------------
+# Fetch data after login
+# -----------------------------
+if st.session_state["access"]:
+    headers = {"Authorization": f"Bearer {st.session_state['access']}"}
+
+    # Example: fetch products
+    try:
+        products_url = f"{DJANGO_BASE}/api/products/"
+        products = requests.get(products_url, headers=headers, timeout=20).json()
+        st.subheader("Products")
+        if products:
+            df_products = pd.DataFrame(products)
+            st.dataframe(df_products)
+        else:
+            st.info("No products available for your role.")
+    except Exception as e:
+        st.error(f"Error fetching products: {e}")
+
+    # Example: fetch orders
+    try:
+        orders_url = f"{DJANGO_BASE}/api/orders/"
+        orders = requests.get(orders_url, headers=headers, timeout=20).json()
+        st.subheader("Orders")
+        if orders:
+            df_orders = pd.DataFrame(orders)
+            st.dataframe(df_orders)
+        else:
+            st.info("No orders available for your role.")
+    except Exception as e:
+        st.error(f"Error fetching orders: {e}")# NEW (used later for DB cache)
 # Use SQLite file directly from repo
 # Ensure session_state is set so the rest of the app works
 if "sqlite_path" not in st.session_state:
@@ -723,3 +784,4 @@ with st.expander("Generate Dummy Data"):
         st.cache_data.clear()
     if st.button("Generate Data"):
         _make_dummy_rows(engine)
+
