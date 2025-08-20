@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 import io
 import xlsxwriter
 from functools import lru_cache  
-import request 
+import requests
 DJANGO_BASE = "http://127.0.0.1:8000"  # ← change this when you deploy Django
 
 # -----------------------------
@@ -784,4 +784,5 @@ with st.expander("Generate Dummy Data"):
         st.cache_data.clear()
     if st.button("Generate Data"):
         _make_dummy_rows(engine)
+
 
