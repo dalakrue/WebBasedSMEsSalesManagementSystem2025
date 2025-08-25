@@ -1,788 +1,446 @@
-import sys
-import datetime as dt
-from typing import Dict, List, Optional, Tuple
-import yaml
-from yaml.loader import SafeLoader
-import os
-import pandas as pd
-import numpy as np
-import streamlit as st
-import sqlalchemy as sa
-from sklearn.linear_model import LinearRegression
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-import plotly.express as px
-import plotly.graph_objects as go
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.decorators import login_required
+from .forms import SignupForm, ProductForm, ReportForm
+from .models import Profile, Product, Cart, Order, OrderItem, Report
+from decimal import Decimal
+from django.contrib.auth.models import User
+from .forms import ProductImportForm
+from django.contrib import messages
+from .forms import ProductForm
+from .models import Profile, Product, Cart, Order, OrderItem, Report, ProductChangeRequest, Category
+from .models import Product, Cart, Order, OrderItem
 import io
-import xlsxwriter
-from functools import lru_cache  
-import requests
-DJANGO_BASE = "http://127.0.0.1:8000"  # ← change this when you deploy Django
-
-# -----------------------------
-# Session state to store token
-# -----------------------------
-if "access" not in st.session_state:
-    st.session_state["access"] = None
-
-# -----------------------------
-# Login form
-# -----------------------------
-if st.session_state["access"] is None:
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-
-        if submitted:
-            login_url = f"{DJANGO_BASE}/api/token/"
-            try:
-                response = requests.post(login_url, json={"username": username, "password": password}, timeout=20)
-                response.raise_for_status()
-                tokens = response.json()
-                st.session_state["access"] = tokens["access"]
-                st.success(f"✅ Logged in as {username}")
-                st.experimental_rerun()  # reload app after login
-            except requests.HTTPError:
-                st.error("❌ Login failed. Check username/password")
-
-# -----------------------------
-# Fetch data after login
-# -----------------------------
-if st.session_state["access"]:
-    headers = {"Authorization": f"Bearer {st.session_state['access']}"}
-
-    # Example: fetch products
-    try:
-        products_url = f"{DJANGO_BASE}/api/products/"
-        products = requests.get(products_url, headers=headers, timeout=20).json()
-        st.subheader("Products")
-        if products:
-            df_products = pd.DataFrame(products)
-            st.dataframe(df_products)
-        else:
-            st.info("No products available for your role.")
-    except Exception as e:
-        st.error(f"Error fetching products: {e}")
-
-    # Example: fetch orders
-    try:
-        orders_url = f"{DJANGO_BASE}/api/orders/"
-        orders = requests.get(orders_url, headers=headers, timeout=20).json()
-        st.subheader("Orders")
-        if orders:
-            df_orders = pd.DataFrame(orders)
-            st.dataframe(df_orders)
-        else:
-            st.info("No orders available for your role.")
-    except Exception as e:
-        st.error(f"Error fetching orders: {e}")# NEW (used later for DB cache)
-# Use SQLite file directly from repo
-# Ensure session_state is set so the rest of the app works
-if "sqlite_path" not in st.session_state:
-    st.session_state["sqlite_path"] = "db.sqlite3"
-    uri = f"sqlite+pysqlite:///{st.session_state['sqlite_path']}"
-    engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
-
-CSV_TABLES = [
-    "users", "orders", "order_details",
-    "products", "payments", "leads",
-    "deals", "activities"
-]
-# Holds any uploaded CSVs when in CSV‐only mode or for overrides
-csv_data: Dict[str, pd.DataFrame] = {}
-
-def to_excel(df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Sheet1")
-    return output.getvalue()
-uploaded_file = st.file_uploader("Upload CSV")
-if uploaded_file:
-    df_csv = pd.read_csv(uploaded_file)
-if st.button("📥 Export to Excel"):
-    if 'df_csv' in locals():
-        st.download_button("Download Excel", to_excel(df_csv), file_name="data_export.xlsx")
-    else:
-        st.warning("No data to export.")
-from fpdf import FPDF
-def generate_pdf_report(summary_text):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    for line in summary_text.split("\n"):
-        pdf.cell(200, 10, txt=line, ln=True)
-    return pdf.output(dest="S").encode("latin1")
-
-if st.button("📄 Export Summary as PDF"):
-    summary = "Sales Report\n\nTop 3 Products...\nRevenue Forecast...\n"
-    pdf_bytes = generate_pdf_report(summary)
-    st.download_button("Download PDF", pdf_bytes, file_name="summary.pdf")
-
-
-# ============================== 2. Page Setup ================================
-st.set_page_config(page_title="📊 SME Sales Management Dashboard",
-                   layout="wide",
-                   initial_sidebar_state="expanded")
-st.title("📊 Advanced Sales Management Dashboard for SMEs")
-# ------------------ SESSION STATE SAFE DEFAULTS ------------------
-# initialize keys we rely on so setting them later is safe
-if "sqlite_path" not in st.session_state:
-    st.session_state["sqlite_path"] = ""   # file path for SQLite DB
-# Optional: keep engine key defined but leave value as-is if user connected earlier
-# (get_engine already uses st.session_state.get(_DB_KEY), so no strict need to set it here)
-# ----------------------------------------------------------------
-
-# ============================== 3. Helper & Utility Functions ================
-
-# ---------- 3.1 Database Connection Management -------------------------------
-_DB_KEY = "db_engine"
-
-def get_engine():
-    """Return a cached engine or None."""
-    return st.session_state.get(_DB_KEY)
-def disconnect_db():
-    """
-    Dispose and forget the cached DB engine.
-    """
-    engine = st.session_state.pop(_DB_KEY, None)
-    if engine is not None:
-        try:
-            engine.dispose()
-        except Exception:
-            pass
-    st.success("🔌 Disconnected from DB")
-
-def connect_db(db_type: Optional[str] = None):
-    """
-    Build and cache a DB engine from sidebar inputs.
-    Supports MySQL and SQLite.
-    """
-    if _DB_KEY in st.session_state:
-        st.info("Already connected.")
-        return st.session_state[_DB_KEY]
-
-    # Read DB type (default to MySQL if not set)
-    db_type = db_type or st.session_state.get("db_type", "MySQL")
-
-    try:
-        if db_type == "SQLite":
-    # Expect a local file path from the sidebar (or uploaded file saved to disk)
-          sqlite_path = st.session_state.get("sqlite_path", "") or ""
-          if not sqlite_path:
-           st.error("Provide a SQLite file path (type it or upload a .db file).")
-           return None
-
-    # Check file exists and is readable
-          if not os.path.exists(sqlite_path):
-            st.error(f"SQLite file not found: {sqlite_path}. Please upload or correct the path.")
-            return None
-
-          uri = f"sqlite+pysqlite:///{sqlite_path}"
-          engine = sa.create_engine(uri, connect_args={"check_same_thread": False})
-
-        else:
-            # MySQL path (values should already be in session_state from the sidebar)
-            host     = st.session_state.get("mysql_host", "localhost")
-            port     = st.session_state.get("mysql_port", "3306")
-            db_name  = st.session_state.get("mysql_db", "sample_data")
-            user     = st.session_state.get("mysql_user", "root")
-            password = st.session_state.get("mysql_password", "root")
-
-            if not all([host, port, db_name, user]):
-                st.warning("Please fill in all database connection details.")
-                return None
-
-            uri = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{db_name}"
-            engine = sa.create_engine(uri, pool_pre_ping=True, pool_recycle=280)
-
-        # Test connection
-        with engine.connect() as _:
-            pass
-
-        st.session_state[_DB_KEY] = engine
-        st.success(f"✅ Connected to {db_type}")
-        return engine
-
-    except Exception as e:
-        st.error(f"❌ Connection failed: {e}")
-        return None
-
-
-
-def merge_price_into_order_details(od: pd.DataFrame,
-                                   prod: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure order_details has a 'price_each' column.
-    If missing, attempt to merge with products['price'] (or 'unit_price').
-    """
-    if od.empty:
-        st.warning("order_details is empty; skipping price merge.")
-        return od
-    if 'price_each' in od.columns:
-        return od
-
-    possible_price_cols = ['price', 'unit_price', 'unitPrice', 'unitprice',
-                           'price_each', 'price_each_usd']
-    price_col_in_products = next((col for col in possible_price_cols if col in prod.columns), None)
-
-    if price_col_in_products is None:
-        st.warning(
-            "⚠️ Could not locate a price column in products; "
-            "order_details will not have revenue calculations."
-        )
-        od['price_each'] = np.nan
-        return od
-
-    if 'product_id' in od.columns and 'product_id' in prod.columns:
-        od['product_id'] = od['product_id'].astype(str)
-        prod['product_id'] = prod['product_id'].astype(str)
-    else:
-        st.warning("product_id missing in either order_details or products.")
-        od['price_each'] = np.nan
-        return od
-
-    od = pd.merge(
-        od,
-        prod[['product_id', price_col_in_products]].rename(
-            columns={price_col_in_products: 'price_each'}
-        ),
-        on='product_id',
-        how='left'
-    )
-
-    if od['price_each'].isna().all():
-        st.warning("⚠️ After merge, all price_each values are NaN.")
-    else:
-        st.success(f"✅ price_each successfully merged from products['{price_col_in_products}'].")
-
-    return od
-
-def _coerce_key_cols(df_left, df_right,
-                     left_key='customer_id',
-                     right_key='user_id',
-                     dtype='str'):
-    """
-    Make sure the two key columns have the same dtype
-    so that pd.merge() does not raise the int64/object
-    mismatch error.
-    """
-    df_left[left_key]  = df_left[left_key].astype(dtype)
-    df_right[right_key] = df_right[right_key].astype(dtype)
-    return df_left, df_right
-
-# ---------- 3.3 KPI Calculation ----------------------------------------------
-def kpi_leads_vs_target(leads_df, annual_target: int):
-    """
-    Return actual count, target and achievement %.
-    Expects leads_df to hold one row per lead with 'created_at' datetime.
-    """
-    if 'created_date' not in leads_df.columns: return 0, annual_target, 0
-    
-    leads_df['created_date'] = pd.to_datetime(leads_df['created_date'])
-    this_year = pd.Timestamp("now").year
-    actual = leads_df[leads_df['created_date'].dt.year == this_year].shape[0]
-    pct = (actual / annual_target) * 100 if annual_target else 0
-    return actual, annual_target, pct
-
-# ---------- 3.4 UI Components ------------------------------------------------
-def kpi_card(value, label, delta=None, prefix="", help_text=""):
-    """
-    Render a single KPI card with optional delta and help text.
-    """
-    st.metric(label, f"{prefix}{value:,.0f}", delta=delta, help=help_text)
-
-def spacer(lines: int = 1):
-    """
-    Produce vertical space in Streamlit.
-    """
-    for _ in range(lines):
-        st.write("")
-
-# ============================== 4. Sidebar & Data Loading ====================
-st.sidebar.title("Configuration")
-st.sidebar.header("1. Database")
-# ------------------------------------------------------------------
-# Choose whether we want to use the database or rely on CSV only
-# ------------------------------------------------------------------
-data_source = st.sidebar.radio(
-    "Data source",
-    ("Database", "CSV only"),
-    horizontal=True,
-    key="data_source_mode"
-)
-if data_source == "Database":
-    st.sidebar.subheader("Database Connection")
-
-    # Choose DB Type
-    db_type = st.sidebar.radio(
-        "DB Type",
-        ("MySQL", "SQLite"),
-        horizontal=True,
-        key="db_type"
-    )
-
-    if db_type == "MySQL":
-        st.sidebar.text_input("Host", value=st.session_state.get("mysql_host", "localhost"), key="mysql_host")
-        st.sidebar.text_input("Port", value=st.session_state.get("mysql_port", "3306"), key="mysql_port")
-        st.sidebar.text_input("Database Name", value=st.session_state.get("mysql_db", "sample_data"), key="mysql_db")
-        st.sidebar.text_input("User", value=st.session_state.get("mysql_user", "root"), key="mysql_user")
-        st.sidebar.text_input("Password", value=st.session_state.get("mysql_password", "root"), type="password", key="mysql_password")
-
-    else:
-        # SQLite path entry (this text_input writes to st.session_state["sqlite_path"] automatically)
-     st.sidebar.text_input(
-      "SQLite file path (or upload below)",
-       value=st.session_state.get("sqlite_path", "sample_data.sqlite3"),
-       key="sqlite_path"
-)
-
-# Upload a SQLite file and save it to a tmp folder. Use a safe write + fallback if session_state set fails.
-up_db = st.sidebar.file_uploader(
-    "…or upload a SQLite .db / .sqlite file",
-    type=["db", "sqlite", "sqlite3"],
-    key="sqlite_upload"
-)
-
-    # Action buttons
-if st.sidebar.button("Connect DB"):
-        connect_db(st.session_state.get("db_type", "MySQL"))
-
-if st.sidebar.button("Disconnect DB"):
-        disconnect_db()
-
-
-engine = get_engine() if data_source == "Database" else None
-
-# --- Prepare empty DataFrames ------------------------------------------------
-users = pd.DataFrame()
-products = pd.DataFrame()
-orders = pd.DataFrame()
-order_details = pd.DataFrame()
-payments = pd.DataFrame()
-leads = pd.DataFrame()
-deals = pd.DataFrame()
-activities = pd.DataFrame()
-customer_payments = pd.DataFrame()
-
-
-# --- Load data from database if connected -------------------------------------
-if engine:
-    @st.cache_data
-    def load_data_from_db(_engine):
-        data = {}
-        table_names = ["payments", "users", "orders", "order_details", "products",
-                       "leads", "deals", "activities", "customer_payments_view"]
-        for table in table_names:
-            try:
-                # Use inspect to check if table exists before querying
-                if sa.inspect(_engine).has_table(table):
-                    data[table] = pd.read_sql(f"SELECT * FROM {table}", _engine)
-                else:
-                    data[table] = pd.DataFrame() # Return empty df if table is missing
-            except Exception as e:
-                st.warning(f"Could not load table '{table}'. Reason: {e}")
-                data[table] = pd.DataFrame()
-        return data
-
-    loaded_data = load_data_from_db(engine)
-    payments = loaded_data.get("payments", pd.DataFrame())
-    users = loaded_data.get("users", pd.DataFrame())
-    orders = loaded_data.get("orders", pd.DataFrame())
-    order_details = loaded_data.get("order_details", pd.DataFrame())
-    products = loaded_data.get("products", pd.DataFrame())
-    leads = loaded_data.get("leads", pd.DataFrame())
-    deals = loaded_data.get("deals", pd.DataFrame())
-    activities = loaded_data.get("activities", pd.DataFrame())
-    customer_payments = loaded_data.get("customer_payments_view", pd.DataFrame())
-    engine = get_engine() if data_source == "Database" else None
-    csv_data: Dict[str, pd.DataFrame] = {} 
-
-# ---------- PATCH-7  (new global guard) ----------
-if data_source == "Database" and engine is None and not csv_data:
-    st.info("Either connect to a database or upload CSV files to proceed.")
-    st.stop()
-# -------------------------------------------------
-
-# ============================== 4. Sidebar & Data Loading ====================
-...
-
-# Add this HERE 👇 (just before pre-processing starts)
-def safe_to_datetime(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    """
-    Safely convert a column in a DataFrame to datetime, handling errors gracefully.
-    """
-    if col in df.columns:
-        try:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-        except Exception as e:
-            st.warning(f"⚠️ Failed to convert {col} to datetime: {e}")
-    else:
-        st.warning(f"⚠️ Column `{col}` not found in dataframe.")
-    return df
-st.header("🔄 Data Pre-processing Status")
-with st.expander("Show Details"):
-    # --- Ensure dates are proper ---------------------------------------------
-    payments = safe_to_datetime(payments, 'payment_date')
-    orders = safe_to_datetime(orders, 'order_date')
-    customer_payments = safe_to_datetime(customer_payments, 'payment_date')
-    leads = safe_to_datetime(leads, 'created_date')
-    deals = safe_to_datetime(deals, 'expected_close_date')
-    activities = safe_to_datetime(activities, 'activity_date')
-    st.write("✓ Date columns converted to datetime format.")
-# ---------- PATCH-6  (CSV data take precedence) ----------
-    for _name, _df in csv_data.items():
-        if not _df.empty:
-           locals()[_name] = _df
-# ----------------------------------------------------------
-    # --- Ensure IDs are strings for joins ------------------------------------
-    for df in [orders, order_details, products, users, payments, customer_payments]:
-        for col in ['order_id', 'user_id', 'product_id', 'customer_id']:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.strip()
-    st.write("✓ Key columns (IDs) standardized to string type for reliable merges.")
-    
-    # --- Guarantee price_each in order_details -------------------------------
-    order_details = merge_price_into_order_details(order_details, products)
-
-    # --- Compute item_revenue safely -----------------------------------------
-    if 'quantity' in order_details.columns and 'price_each' in order_details.columns:
-        order_details['item_revenue'] = pd.to_numeric(order_details['quantity'], errors='coerce') * \
-                                        pd.to_numeric(order_details['price_each'], errors='coerce')
-        st.write("✓ 'item_revenue' calculated for order details.")
-    else:
-        order_details['item_revenue'] = np.nan
-
-st.markdown("---")
-
-# ============================== 6. KPI SECTION ===============================
-st.header("🏆 Key Performance Indicators")
-
-# Calculate KPIs only if the necessary data is available
-total_revenue = payments['amount'].sum() if 'amount' in payments.columns else 0
-total_orders = orders['order_id'].nunique() if not orders.empty and 'order_id' in orders.columns else 0
-total_customers = users[users['user_type'] == 'customer']['user_id'].nunique() if not users.empty and 'user_type' in users.columns else 0
-total_products = products['product_id'].nunique() if not products.empty else 0
-
-# Time-based KPIs
-revenue_this_month, rev_delta = (0, None)
-if 'payment_date' in payments.columns:
-    current_month_mask = payments['payment_date'].dt.to_period('M') == pd.Timestamp.today().to_period('M')
-    last_month_mask = payments['payment_date'].dt.to_period('M') == (pd.Timestamp.today() - pd.DateOffset(months=1)).to_period('M')
-    revenue_this_month = payments.loc[current_month_mask, 'amount'].sum()
-    revenue_last_month = payments.loc[last_month_mask, 'amount'].sum()
-    if revenue_last_month > 0:
-        rev_delta = f"{((revenue_this_month - revenue_last_month) / revenue_last_month * 100):.0f}%"
-
-lead_this_month, lead_delta = (0, None)
-if 'created_date' in leads.columns:
-    current_month_mask = leads['created_date'].dt.to_period('M') == pd.Timestamp.today().to_period('M')
-    last_month_mask = leads['created_date'].dt.to_period('M') == (pd.Timestamp.today() - pd.DateOffset(months=1)).to_period('M')
-    lead_this_month = current_month_mask.sum()
-    lead_last_month = last_month_mask.sum()
-    if lead_last_month > 0:
-        lead_delta = f"{(lead_this_month - lead_last_month) / lead_last_month * 100:.0f}% vs last month"
-    
-pipeline_deals = deals[deals['stage'] != 'Closed Won'].shape[0] if not deals.empty and 'stage' in deals.columns else 0
-
-# Display KPIs
-kpi_cols = st.columns(4)
-kpi_cols[0].metric("Leads This Month", f"{lead_this_month:,}", delta=lead_delta)
-kpi_cols[1].metric("Revenue This Month", f"MMK {revenue_this_month:,.0f}", delta=rev_delta)
-kpi_cols[2].metric("Deals in Pipeline", f"{pipeline_deals:,}")
-kpi_cols[3].metric("Active Customers", f"{total_customers:,}")
-
-spacer()
-
-glob_cols = st.columns(4)
-glob_cols[0].metric("💰 Total Lifetime Revenue", f"MMK {total_revenue:,.0f}")
-glob_cols[1].metric("🛒 Total Orders", f"{total_orders:,}")
-glob_cols[2].metric("📦 Total Products", f"{total_products:,}")
-glob_cols[3].metric("👥 Total Customers", f"{total_customers:,}")
-
-st.markdown("---")
-
-# ============================== 7. Revenue Trend & Forecast ==================
-st.header("📈 Revenue Analytics")
-
-if 'payment_date' in payments.columns and not payments.empty:
-    payments['month'] = payments['payment_date'].dt.to_period('M').astype(str)
-    monthly_rev = payments.groupby('month')['amount'].sum().reset_index()
-
-    tab_trend, tab_forecast = st.tabs(["Monthly Trend", "3-Month Forecast"])
-
-    with tab_trend:
-        fig_month = px.line(monthly_rev, x='month', y='amount', title="Actual Monthly Revenue",
-                            markers=True, labels={'amount': 'Revenue (MMK)'})
-        st.plotly_chart(fig_month, use_container_width=True)
-
-    with tab_forecast:
-        if len(monthly_rev) >= 3:
-            monthly_rev['idx'] = np.arange(len(monthly_rev))
-            model = LinearRegression().fit(monthly_rev[['idx']], monthly_rev['amount'])
-            
-            future_idx = range(len(monthly_rev), len(monthly_rev) + 3)
-            future_amount = model.predict(np.array(future_idx).reshape(-1, 1))
-            last_month = pd.to_datetime(monthly_rev['month'].iloc[-1])
-            future_months = [(last_month + pd.DateOffset(months=i+1)).strftime('%Y-%m') for i in range(3)]
-
-            future_df = pd.DataFrame({'month': future_months, 'amount': future_amount})
-            combined = pd.concat([monthly_rev[['month', 'amount']], future_df])
-
-            fig_fore = px.line(combined, x='month', y='amount', title="Actual + 3-Month Forecast", markers=True,
-                               labels={'amount': 'Revenue (MMK)'})
-            fig_fore.add_vline(x=monthly_rev['month'].iloc[-1], line_width=2, line_dash="dash", line_color="green")
-            st.plotly_chart(fig_fore, use_container_width=True)
-        else:
-            st.info("📈 Need at least 3 months of revenue data for forecasting.")
-else:
-    st.info("📈 `payments` table with `payment_date` and `amount` columns is required for revenue analytics.")
-
-st.markdown("---")
-
-# ============================== 8. Target vs Actual ==========================
-st.header("🎯 Target vs Actual")
-
-cols_targets = st.columns(2)
-
-with cols_targets[0]:
-    if not leads.empty:
-        target_leads = st.number_input("Annual Lead Target", min_value=1, value=5000, step=100)
-        actual, target, pct = kpi_leads_vs_target(leads, annual_target=target_leads)
-        st.metric("Leads (YTD)", f"{actual:,}", delta=f"{pct:0.1f}% of target ({target:,})")
-
-        fig_lead = go.Figure(go.Indicator(
-            mode="gauge+number", value=actual,
-            title={'text': 'Lead Generation (YTD)'},
-            gauge={'axis': {'range': [None, target]}, 'bar': {'color': '#2ECC71'}}))
-        st.plotly_chart(fig_lead, use_container_width=True)
-    else:
-        st.info("🎯 `leads` table is required for this chart.")
-
-with cols_targets[1]:
-    if not payments.empty:
-        target_rev = st.number_input("Annual Revenue Target (MMK)", min_value=1000, value=50_000_000, step=100_000)
-        rev_ytd = payments[payments['payment_date'].dt.year == dt.datetime.today().year]['amount'].sum()
-        
-        fig_bullet = go.Figure(go.Indicator(
-            mode="number+gauge+delta", value=rev_ytd,
-            title={'text': "Revenue (YTD)"},
-            gauge={'shape': "bullet", 'axis': {'range': [None, target_rev]}, 'bar': {'color': '#5DADE2'}},
-            delta={'reference': target_rev, 'position': "bottom"}))
-        st.plotly_chart(fig_bullet, use_container_width=True)
-    else:
-        st.info("🎯 `payments` table is required for this chart.")
-
-st.markdown("---")
-
-st.header("🤖 Customer Segmentation (RFM Lite)")
-
-if not customer_payments.empty and 'customer_id' in customer_payments.columns:
-    seg_data = customer_payments.groupby('customer_id').agg(
-        recency_days=('payment_date', lambda x: (dt.datetime.now(x.dt.tz) - x.max()).days if x.dt.tz else (dt.datetime.now() - x.max()).days),
-        frequency=('payment_id', 'count'),
-        monetary=('amount', 'sum')
-    ).reset_index()
-
-    use_cols = st.multiselect("Select features for clustering",
-                              ['recency_days', 'frequency', 'monetary'],
-                              default=['frequency', 'monetary'])
-
-    if len(use_cols) >= 2:
-        X_scaled = StandardScaler().fit_transform(seg_data[use_cols])
-        k = st.slider("Number of clusters (K)", 2, 6, 3, key="kmeans_k")
-        km = KMeans(n_clusters=k, random_state=42, n_init='auto')
-        seg_data['segment'] = km.fit_predict(X_scaled)
-
-        if not users.empty:
-            # This is where the offending merge call was.
-            # The new function is inserted just before it.
-            seg_data, users = _coerce_key_cols(seg_data, users,
-                                               left_key='customer_id',
-                                               right_key='user_id',
-                                               dtype='str')
-
-            # … your original merge line now works
-            seg_data = (
-                seg_data.merge(
-                    users[['user_id', 'name']],
-                    left_on='customer_id',
-                    right_on='user_id',
-                    how='left'
-                )
-                .rename(columns={'name': 'customer_name'})
+import csv
+# User/Seller Signup & Login
+
+def signup_view(request):
+    if request.method == "POST":
+        form = SignupForm(request.POST)
+        if form.is_valid():
+            user = form.save(commit=False)
+            password = form.cleaned_data['password']
+            role = form.cleaned_data['role']
+            address = form.cleaned_data.get('address')
+            phone_number = form.cleaned_data.get('phone_number')
+
+            user.set_password(password)
+            user.save()
+
+            Profile.objects.create(
+                user=user,
+                role=role,
+                address=address if role == 'seller' else '',
+                phone_number=phone_number if role == 'seller' else ''
             )
 
-        fig_seg = px.scatter(
-            seg_data,
-            x=use_cols[0], y=use_cols[1],
-            color=seg_data['segment'].astype(str),
-            size='monetary' if 'monetary' in seg_data.columns else None,
-            hover_data=['customer_name', 'recency_days', 'frequency', 'monetary'],
-            title="Customer Segments"
-        )
-        st.plotly_chart(fig_seg, use_container_width=True)
-
-        st.subheader("Segment Summary")
-        summary = seg_data.groupby('segment').agg(
-            customers=('customer_id', 'count'),
-            avg_recency=('recency_days', 'mean'),
-            avg_frequency=('frequency', 'mean'),
-            avg_monetary=('monetary', 'mean')
-        ).style.format({'customers': "{:,.0f}", 'avg_recency': "{:,.1f} days",
-                          'avg_frequency': "{:,.1f}x", 'avg_monetary': "MMK {:,.0f}"})
-        st.dataframe(summary, use_container_width=True)
-
+            return redirect('login')
     else:
-        st.info("ℹ️ Select at least 2 dimensions for clustering.")
-else:
-    st.info("🤖 `customer_payments_view` is required for segmentation.")
+        form = SignupForm()
+    return render(request, 'core/signup.html', {'form': form})
 
-st.markdown("---")
+def login_view(request):
+    if request.method == "POST":
+        username = request.POST['username']
+        password = request.POST['password']
+        user = authenticate(username=username, password=password)
+        if user:
+            login(request, user)
 
+            if user.is_superuser:
+                request.session['role'] = 'admin'
+                return redirect('dashboard_admin')
 
-# ============================== 10. Product Performance ======================
-st.header("🏅 Product Performance")
-
-if not order_details.empty and not products.empty and 'quantity' in order_details.columns:
-    prod_perf = order_details.groupby('product_id').agg(
-        qty_sold=('quantity', 'sum'),
-        revenue=('item_revenue', 'sum')
-    ).reset_index()
-
-    prod_perf = prod_perf.merge(products[['product_id', 'name']], on='product_id', how='left')
-
-    n_top = st.slider("Show Top N Products", 3, min(20, len(prod_perf) or 21), 10, key="top_n_prod")
-
-    tab_qty, tab_rev = st.tabs(["By Quantity Sold", "By Revenue Generated"])
-
-    with tab_qty:
-        top_qty = prod_perf.sort_values('qty_sold', ascending=False).head(n_top)
-        fig_q = px.bar(top_qty, x='name', y='qty_sold', color='qty_sold',
-                       color_continuous_scale='Plasma', title=f"Top {n_top} Products by Quantity",
-                       labels={'name': 'Product', 'qty_sold': 'Total Quantity Sold'})
-        st.plotly_chart(fig_q, use_container_width=True)
-
-    with tab_rev:
-        top_rev = prod_perf.sort_values('revenue', ascending=False).head(n_top)
-        fig_r = px.bar(top_rev, x='name', y='revenue', color='revenue',
-                       color_continuous_scale='Viridis', title=f"Top {n_top} Products by Revenue",
-                       labels={'name': 'Product', 'revenue': 'Total Revenue (MMK)'})
-        st.plotly_chart(fig_r, use_container_width=True)
-else:
-    st.info("🏅 `order_details` and `products` tables are required for product performance analysis.")
-
-st.markdown("---")
-
-# ============================== 11. Sales Funnel =============================
-st.header("🔻 Sales Funnel")
-
-if not deals.empty and 'stage' in deals.columns and 'value' in deals.columns:
-    default_stages = ["Prospect", "Qualified", "Proposal", "Negotiation", "Won", "Lost"]
-    # Filter to only stages that actually exist in the data to avoid errors
-    existing_stages = [s for s in default_stages if s in deals['stage'].unique()]
-    
-    stage_counts = deals['stage'].value_counts().reindex(existing_stages).reset_index()
-    stage_counts.columns = ['stage', 'count']
-
-    fig_funnel = go.Figure(go.Funnel(
-        y=stage_counts['stage'],
-        x=stage_counts['count'],
-        textinfo="value+percent initial"
-    ))
-    fig_funnel.update_layout(title_text="Deal Stage Funnel")
-    st.plotly_chart(fig_funnel, use_container_width=True)
-else:
-    st.info("🔻 `deals` table with `stage` and `value` columns required for funnel visualization.")
-
-st.markdown("---")
-
-# ============================== 12. Advanced Data Tools ======================
-st.header("🛠️ Advanced Data Tools")
-
-st.sidebar.header("2. CSV files")
-for tbl in CSV_TABLES:
-    up = st.sidebar.file_uploader(f"Upload {tbl}.csv", type="csv", key=f"csv_{tbl}")
-    if up:
-        try:
-            csv_data[tbl] = pd.read_csv(up)
-            st.sidebar.success(f"{tbl}.csv loaded ({len(csv_data[tbl])} rows)")
-        except Exception as e:
-            st.sidebar.error(f"Error in {tbl}.csv: {e}")
-# ------------------------ PATCH 9  conditional writer -----------------------
-if data_source == "Database":
- with st.expander("Upload CSV Data to Database"):
-    REQUIRED_TABLES = {
-    "payments":        ["payment_id", "customer_id", "amount", "payment_date"],
-    "deals":           ["deal_id", "customer_id", "stage", "value", "created_at"],
-    "activities":      ["activity_id", "customer_id", "activity_date", "activity_type"],
-    "leads":           ["lead_id", "customer_id", "source", "created_at"],
-    "users":           ["user_id", "name", "email", "password", "phone", "user_type"],
-    "products":        ["product_id", "name", "description", "price", "stock_quantity", "seller_id"],
-    "orders":          ["order_id", "customer_id", "order_date", "status"],
-    "order_details":   ["order_detail_id", "order_id", "product_id", "quantity", "price_each"]
-}
-   
-    def check_columns(df, table_name):
-        reqs = REQUIRED_TABLES.get(table_name)
-        if not reqs: return # No requirements defined for this table
-        missing = [c for c in reqs if c not in df.columns]
-        if missing:
-            raise ValueError(f"`{table_name}` is missing required columns: {missing}")
-    def write_table(df, table_name, if_exists="append"):
-        db_engine = get_engine()
-        if db_engine is None:
-            st.error("Connect to DB first before ingesting data."); return
-        try:
-            check_columns(df, table_name)
-            df.to_sql(table_name, db_engine, if_exists=if_exists, index=False)
-            st.success(f"✅ Ingested {len(df):,} rows into `{table_name}`.")
-            st.cache_data.clear() # Clear cache to force a reload
-        except Exception as e:
-            st.error(f"❌ Failed to write to `{table_name}`. Reason: {e}")
-    for table in ["payments", "deals", "activities", "leads"]:
-        up = st.file_uploader(f"Upload `{table}.csv`", type="csv", key=f"upload_{table}")
-        if up:
             try:
-                df_csv = pd.read_csv(up)
-                write_table(df_csv, table)
-            except Exception as e:
-                st.error(f"Could not process CSV for `{table}`. Error: {e}")
-with st.expander("Generate Dummy Data"):
-    st.write("Use this tool to populate your database with sample data if the tables are empty.")
-    def _make_dummy_rows(db_engine):
-        if not db_engine:
-            st.error("Connect to a database first."); return
-        inspector = sa.inspect(db_engine)
-        if not inspector.has_table("payments"):
-            pay = pd.DataFrame({
-                "payment_id"  : range(1, 11), "customer_id" : np.random.randint(1, 6, 10),
-                "amount"      : np.random.randint(5000, 50000, 10),
-                "payment_date": pd.to_datetime(pd.date_range(end=dt.date.today(), periods=10, freq="M"))
-            })
-            pay.to_sql("payments", db_engine, index=False)
-            st.write("✓ Created `payments` table.")
-        if not inspector.has_table("deals"):
-            deals_df = pd.DataFrame({
-                "deal_id"     : range(1, 11), "customer_id" : np.random.randint(1, 6, 10),
-                "stage"       : np.random.choice(["Prospect", "Qualified", "Proposal", "Won"], 10),
-                "value"       : np.random.randint(10000, 100000, 10),
-                "created_at"  : pd.to_datetime(pd.date_range(end=dt.date.today(), periods=10, freq="7D"))
-            })
-            deals_df.to_sql("deals", db_engine, index=False)
-            st.write("✓ Created `deals` table.")
-        if not inspector.has_table("activities"):
-            acts = pd.DataFrame({
-                "activity_id"   : range(1, 21), "customer_id"   : np.random.randint(1, 6, 20),
-                "activity_date" : pd.to_datetime(pd.date_range(end=dt.date.today(), periods=20, freq="3D")),
-                "activity_type" : np.random.choice(["Call", "Email", "Demo", "Meeting"], 20),
-                "notes"         : [""]*20
-            })
-            acts.to_sql("activities", db_engine, index=False)
-            st.write("✓ Created `activities` table.")
-        st.success("Dummy data generation complete. Refresh the page to see changes.")
-        st.cache_data.clear()
-    if st.button("Generate Data"):
-        _make_dummy_rows(engine)
+                role = user.profile.role
+                request.session['role'] = role
+                return redirect(f'dashboard_{role}')
+            except Profile.DoesNotExist:
+                logout(request)
+                return render(request, 'core/login.html', {'error': 'Profile not found'})
+        else:
+            return render(request, 'core/login.html', {'error': 'Invalid credentials'})
+    return render(request, 'core/login.html')
+
+def logout_view(request):
+    logout(request)
+    return redirect('login')
+
+# Admin Static Login System
+
+def admin_login(request):
+    if request.method == "POST":
+        username = request.POST.get('username')
+        password = request.POST.get('password')
+        if username == 'admin' and password == 'admin123':
+            request.session['is_admin'] = True
+            return redirect('dashboard_admin')
+        else:
+            return render(request, 'core/admin_login.html', {'error': 'Invalid admin credentials'})
+    return render(request, 'core/admin_login.html')
+
+def admin_logout(request):
+    request.session.flush()
+    return redirect('admin_login')
+
+# Dashboards
+
+# Buyer dashboard - hide out-of-stock products
+@login_required
+def dashboard_user(request):
+    products = Product.objects.filter(approved=True, quantity__gt=0)
+    return render(request, 'core/dashboard_buyer.html', {'products': products})
+
+@login_required(login_url='login')
+def dashboard_seller(request):
+    products = Product.objects.filter(seller=request.user)
+    return render(request, 'core/dashboard_seller.html', {'products': products})
 
 
+def dashboard_admin(request):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+
+    products = Product.objects.all()
+
+    # Fetch pending edit and delete requests
+    edit_requests = ProductChangeRequest.objects.filter(request_type='edit', approved=False)
+    delete_requests = ProductChangeRequest.objects.filter(request_type='delete', approved=False)
+
+    # Optional summary counts for dashboard cards
+    total_products = products.count()
+    pending_edit_requests = edit_requests.count()
+    pending_delete_requests = delete_requests.count()
+
+    context = {
+        'products': products,
+        'edit_requests': edit_requests,
+        'delete_requests': delete_requests,
+        'total_products': total_products,
+        'pending_edit_requests': pending_edit_requests,
+        'pending_delete_requests': pending_delete_requests
+    }
+
+    return render(request, 'core/dashboard_admin.html', context)
+
+# Seller Product Features
+
+@login_required(login_url='login')
+def add_product(request):
+    if request.method == 'POST':
+        form = ProductForm(request.POST, request.FILES)  # Important: include request.FILES
+        if form.is_valid():
+            product = form.save(commit=False)
+            product.seller = request.user  # assign the logged in user as seller
+            product.save()
+            messages.success(request, "Product added successfully!")
+            return redirect('dashboard_seller')
+        else:
+            # You can print to console or log errors to debug
+            print(form.errors)
+    else:
+        form = ProductForm()
+
+    return render(request, 'core/add_product.html', {'form': form})
+# Admin Approval
+
+def approve_product(request, product_id):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+    product = get_object_or_404(Product, id=product_id)
+    product.approved = True
+    product.save()
+    return redirect('dashboard_admin')
+
+# Admin Delete Product
+
+def delete_product(request, product_id):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+    if request.method == 'POST':
+        product = get_object_or_404(Product, id=product_id)
+        product.delete()
+    return redirect('dashboard_admin')
+
+# Buyer: Cart + Checkout
+
+# Add product to cart
+@login_required
+def add_to_cart(request, product_id):
+    product = get_object_or_404(Product, id=product_id, approved=True)
+    if product.quantity < 1:
+        messages.error(request, f"{product.name} is out of stock.")
+        return redirect('dashboard_user')
+
+    cart_item, created = Cart.objects.get_or_create(user=request.user, product=product)
+    if not created:
+        cart_item.quantity += 1
+        cart_item.save()
+    messages.success(request, f"Added {product.name} to cart.")
+    return redirect('dashboard_user')
+
+# View cart
+@login_required
+def cart_view(request):
+    cart_items = Cart.objects.filter(user=request.user)
+    for item in cart_items:
+        item.subtotal = item.quantity * item.product.price
+    total = sum(item.subtotal for item in cart_items)
+    return render(request, 'core/cart.html', {'cart_items': cart_items, 'total': total})
+
+# Update quantity
+@login_required
+def update_cart_quantity(request, item_id):
+    cart_item = get_object_or_404(Cart, id=item_id, user=request.user)
+    if request.method == 'POST':
+        new_quantity = int(request.POST.get('quantity', 1))
+        if new_quantity > 0:
+            cart_item.quantity = new_quantity
+            cart_item.save()
+    return redirect('cart')
+
+# Remove item from cart
+@login_required
+def remove_from_cart(request, item_id):
+    cart_item = get_object_or_404(Cart, id=item_id, user=request.user)
+    cart_item.delete()
+    messages.success(request, "Item removed from cart.")
+    return redirect('cart')
+
+# Checkout
+@login_required
+def checkout(request):
+    cart_items = Cart.objects.filter(user=request.user)
+    total = sum(Decimal(str(item.product.price)) * item.quantity for item in cart_items)
+
+    if request.method == 'POST':
+        # Check stock
+        for item in cart_items:
+            if item.product.quantity < item.quantity:
+                return render(request, 'core/checkout.html', {
+                    'total': total,
+                    'error': f"Not enough stock for {item.product.name}."
+                })
+
+        # Create order
+        order = Order.objects.create(user=request.user, total_price=total)
+        for item in cart_items:
+            OrderItem.objects.create(
+                order=order,
+                product=item.product,
+                quantity=item.quantity,
+                seller=item.product.seller
+            )
+            # Update product quantity
+            product = item.product
+            product.quantity -= item.quantity
+            product.save()
+
+        cart_items.delete()
+        return render(request, 'core/checkout.html', {'success': True})
+
+    return render(request, 'core/checkout.html', {'total': total})
+
+
+
+
+@login_required(login_url='login')
+def buyer_orders(request):
+    orders = Order.objects.filter(user=request.user).order_by('-created_at')
+    return render(request, 'core/buyer_orders.html', {'orders': orders})
+
+@login_required(login_url='login')
+def seller_orders(request):
+    order_items = OrderItem.objects.filter(seller=request.user).select_related('order').order_by('-order__created_at')
+    return render(request, 'core/seller_orders.html', {'order_items': order_items})
+
+def admin_orders(request):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+    orders = Order.objects.all().order_by('-created_at')
+    return render(request, 'core/admin_orders.html', {'orders': orders})
+
+@login_required
+def report_issue(request):
+    user = request.user
+    # Check role based on profile.role field
+    role = 'buyer' if getattr(user.profile, 'role', '') == 'user' else 'seller'
+    if request.method == 'POST':
+        form = ReportForm(request.POST)
+        if form.is_valid():
+            report = form.save(commit=False)
+            report.reporter = user
+            report.role = role
+            report.save()
+            return redirect('dashboard_user' if role == 'buyer' else 'dashboard_seller')
+    else:
+        form = ReportForm()
+
+    return render(request, 'core/report_form.html', {'form': form, 'role': role})
+
+def view_reports_admin(request):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+
+    reports = Report.objects.all().order_by('-submitted_at')
+    return render(request, 'core/admin_reports.html', {'reports': reports})
+
+def admin_logout(request):
+    request.session.flush()  # Clears all session data
+    return redirect('admin_login')
+
+def import_products_view(request):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+
+    if request.method == 'POST':
+        form = ProductImportForm(request.POST, request.FILES)
+        if form.is_valid():
+            csv_file = request.FILES['csv_file']
+            if not csv_file.name.endswith('.csv'):
+                messages.error(request, "Please upload a CSV file.")
+                return redirect('import-products')
+
+            decoded_file = csv_file.read().decode('utf-8')
+            io_string = io.StringIO(decoded_file)
+            reader = csv.DictReader(io_string)
+
+            created_count = 0
+            skipped_count = 0
+
+            for row in reader:
+                try:
+                    # Get seller
+                    seller_username = row.get('seller')
+                    if not seller_username:
+                        skipped_count += 1
+                        continue
+                    seller = User.objects.get(username=seller_username)
+
+                    # Get category by name
+                    category_name = row.get('category')
+                    category = Category.objects.filter(name=category_name).first() if category_name else None
+
+                    Product.objects.create(
+                        seller=seller,
+                        name=row.get('name'),
+                        description=row.get('description'),
+                        price=Decimal(row.get('price') or '0'),
+                        category=category,
+                        image=None,
+                        approved=False
+                    )
+                    created_count += 1
+                except User.DoesNotExist:
+                    skipped_count += 1
+                except Exception:
+                    skipped_count += 1
+
+            messages.success(request, f"Imported {created_count} products. Skipped {skipped_count} rows.")
+            return redirect('dashboard_admin')
+    else:
+        form = ProductImportForm()
+
+    return render(request, 'core/import_products.html', {'form': form})
+
+# For edit request
+@login_required
+def request_product_edit(request, product_id):
+    product = get_object_or_404(Product, id=product_id, seller=request.user)
+
+    # 🚨 Block if product is not approved
+    if not product.approved:
+        messages.error(request, "You can only request edits after the product has been approved by admin.")
+        return redirect('dashboard_seller')
+
+    if request.method == "POST":
+        form = ProductForm(request.POST, request.FILES, instance=product)
+        if form.is_valid():
+            ProductChangeRequest.objects.create(
+                seller=request.user,
+                product=product,
+                request_type='edit',
+                new_name=form.cleaned_data.get('name'),
+                new_description=form.cleaned_data.get('description'),
+                new_price=form.cleaned_data.get('price'),
+                new_quantity=form.cleaned_data.get('quantity'),
+                new_category=form.cleaned_data.get('category'),
+                new_image=form.cleaned_data.get('image')
+            )
+            messages.success(request, "Edit request submitted to admin.")
+            return redirect('dashboard_seller')
+    else:
+        form = ProductForm(instance=product)
+    return render(request, 'core/request_product_edit.html', {'form': form, 'product': product})
+
+
+# For delete request
+@login_required
+def request_product_delete(request, product_id):
+    product = get_object_or_404(Product, id=product_id, seller=request.user)
+
+    # 🚨 Block if product is not approved
+    if not product.approved:
+        messages.error(request, "You can only request deletion after the product has been approved by admin.")
+        return redirect('dashboard_seller')
+
+    if request.method == "POST":
+        ProductChangeRequest.objects.create(
+            seller=request.user,
+            product=product,
+            request_type='delete'
+        )
+        messages.warning(request, "Delete request sent to admin.")
+        return redirect('dashboard_seller')
+
+    return render(request, 'core/request_product_delete.html', {'product': product})
+
+
+# Admin: view all requests
+def admin_change_requests(request):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+    requests = ProductChangeRequest.objects.filter(approved=False).order_by('-created_at')
+    return render(request, 'core/admin_change_requests.html', {'requests': requests})
+
+
+
+def approve_change_request(request, request_id):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+
+    change_request = get_object_or_404(ProductChangeRequest, id=request_id)
+
+    if change_request.request_type == 'edit':
+        product = change_request.product
+        if change_request.new_name: product.name = change_request.new_name
+        if change_request.new_description: product.description = change_request.new_description
+        if change_request.new_price: product.price = change_request.new_price
+        if change_request.new_quantity: product.quantity = change_request.new_quantity
+        if change_request.new_category: product.category = change_request.new_category
+        if change_request.new_image: product.image = change_request.new_image
+
+        product.approved = True
+        product.save()
+
+        change_request.approved = True
+        change_request.save()
+        messages.success(request, "Edit request approved successfully.")
+
+    elif change_request.request_type == 'delete':
+        change_request.product.delete()
+        change_request.delete()
+        messages.success(request, "Delete request approved and product removed.")
+
+    return redirect('dashboard_admin')
+
+
+
+def reject_change_request(request, request_id):
+    if not request.session.get('is_admin'):
+        return redirect('admin_login')
+
+    change_request = get_object_or_404(ProductChangeRequest, id=request_id)
+    change_request.delete()
+    messages.error(request, "Change request rejected.")
+    return redirect('dashboard_admin')
