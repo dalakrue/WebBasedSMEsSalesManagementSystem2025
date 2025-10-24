@@ -7,3 +7,49 @@ plotly
 XlsxWriter
 sqlalchemy
 fpdf
+# Core Framework
+Django==5.0.3
+
+# Database Connector (if using MySQL)
+mysqlclient==2.2.4
+
+# Data Handling & Analysis
+pandas==2.2.1
+numpy==1.26.4
+
+# Visualization & Reporting
+matplotlib==3.8.3
+plotly==5.19.0
+seaborn==0.13.2
+
+# File Handling
+openpyxl==3.1.2
+xlrd==2.0.1
+
+# REST API (optional for later expansion)
+djangorestframework==3.15.1
+
+# Authentication & Security
+django-crispy-forms==2.1
+crispy-bootstrap5==0.7
+
+# Environment Variables
+python-dotenv==1.0.1
+
+# Date & Time Utilities
+django-extensions==3.2.3
+
+# For CORS (if you integrate with Power BI or APIs)
+django-cors-headers==4.4.0
+
+# For Data Import/Export
+django-import-export==3.3.6
+
+# For PDF or Excel Report Generation
+reportlab==4.1.0
+xhtml2pdf==0.2.15
+
+# For Forecasting or ML Expansion
+scikit-learn==1.4.2
+statsmodels==0.14.1
+
